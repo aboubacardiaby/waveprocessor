@@ -1,0 +1,144 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Build and deploy WaveProcessor to GCP Cloud Run
+# Auth: Workload Identity Federation (no long-lived JSON keys)
+#
+# Required GitHub secrets:
+#   GCP_PROJECT_ID                – GCP project ID (e.g. my-project-123)
+#   GCP_WORKLOAD_IDENTITY_PROVIDER – Full provider resource name:
+#                                    projects/PROJECT_NUMBER/locations/global/
+#                                    workloadIdentityPools/POOL_ID/providers/PROVIDER_ID
+#   GCP_SERVICE_ACCOUNT           – SA email (e.g. github-deployer@my-project.iam.gserviceaccount.com)
+#                                   SA needs roles:
+#                                     - roles/artifactregistry.writer
+#                                     - roles/run.admin
+#                                     - roles/iam.serviceAccountUser
+#   DB_CONNECTION_STRING          – Full Npgsql connection string
+#   WAVE_BASE_URL                 – Wave API base URL
+#   WAVE_PHONE_NUMBER             – Wave account phone number
+#   WAVE_PIN                      – Wave account PIN
+#   WAVE_API_KEY                  – Pre-issued JWT bearer token (fallback)
+#
+# ── One-time GCP setup ────────────────────────────────────────────────────────
+#
+#   PROJECT_ID=my-project-123
+#   REPO=YOUR_GITHUB_ORG/YOUR_REPO          # e.g. acme/waveprocessor
+#   SA=github-deployer@${PROJECT_ID}.iam.gserviceaccount.com
+#
+#   # 1. Create service account
+#   gcloud iam service-accounts create github-deployer \
+#     --project=$PROJECT_ID
+#
+#   # 2. Grant required roles
+#   for ROLE in roles/artifactregistry.writer roles/run.admin roles/iam.serviceAccountUser; do
+#     gcloud projects add-iam-policy-binding $PROJECT_ID \
+#       --member="serviceAccount:$SA" --role="$ROLE"
+#   done
+#
+#   # 3. Create Workload Identity Pool
+#   gcloud iam workload-identity-pools create github-pool \
+#     --location=global --project=$PROJECT_ID
+#
+#   # 4. Create OIDC provider for GitHub Actions
+#   gcloud iam workload-identity-pools providers create-oidc github-provider \
+#     --location=global \
+#     --workload-identity-pool=github-pool \
+#     --issuer-uri="https://token.actions.githubusercontent.com" \
+#     --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+#     --attribute-condition="assertion.repository=='${REPO}'" \
+#     --project=$PROJECT_ID
+#
+#   # 5. Allow the repo's tokens to impersonate the SA
+#   POOL_NAME=$(gcloud iam workload-identity-pools describe github-pool \
+#     --location=global --project=$PROJECT_ID --format="value(name)")
+#
+#   gcloud iam service-accounts add-iam-policy-binding $SA \
+#     --role=roles/iam.workloadIdentityUser \
+#     --member="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.repository/${REPO}" \
+#     --project=$PROJECT_ID
+#
+#   # 6. Copy the provider resource name into GitHub secret GCP_WORKLOAD_IDENTITY_PROVIDER:
+#   gcloud iam workload-identity-pools providers describe github-provider \
+#     --location=global \
+#     --workload-identity-pool=github-pool \
+#     --project=$PROJECT_ID \
+#     --format="value(name)"
+#
+#   # 7. Create Artifact Registry repo (once)
+#   gcloud artifacts repositories create waveprocessor \
+#     --repository-format=docker \
+#     --location=us-central1 \
+#     --project=$PROJECT_ID
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy to GCP Cloud Run
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGION: us-central1
+  REPOSITORY: waveprocessor
+  SERVICE: waveprocessor
+
+jobs:
+  build-and-deploy:
+    name: Build, push, deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for Workload Identity Federation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push Docker image
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${PROJECT_ID}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }}"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          DB_CONN: ${{ secrets.DB_CONNECTION_STRING }}
+          WAVE_URL: ${{ secrets.WAVE_BASE_URL }}
+          WAVE_PHONE: ${{ secrets.WAVE_PHONE_NUMBER }}
+          WAVE_PIN: ${{ secrets.WAVE_PIN }}
+          WAVE_KEY: ${{ secrets.WAVE_API_KEY }}
+        run: |
+          # ^|^ changes the env-var list separator from comma to pipe,
+          # avoiding conflicts with semicolons in the connection string.
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --image "$IMAGE_URI" \
+            --region "${{ env.REGION }}" \
+            --project "$PROJECT_ID" \
+            --platform managed \
+            --port 8080 \
+            --allow-unauthenticated \
+            --set-env-vars "^|^ConnectionStrings__DefaultConnection=$DB_CONN|Wave__BaseUrl=$WAVE_URL|Wave__PhoneNumber=$WAVE_PHONE|Wave__Pin=$WAVE_PIN|Wave__ApiKey=$WAVE_KEY"
+
+      - name: Print service URL
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          gcloud run services describe "${{ env.SERVICE }}" \
+            --region "${{ env.REGION }}" \
+            --project "$PROJECT_ID" \
+            --format "value(status.url)"
