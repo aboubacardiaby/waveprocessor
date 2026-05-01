@@ -72,36 +72,36 @@ public class TransactionProcessorWorker : BackgroundService
     {
         _logger.LogInformation("Processing transaction {Ref} (id={Id})", transaction.TransactionRef, transaction.Id);
 
-        var (toPhone, sendAmount, recvCurrency) = ExtractWaveFields(transaction);
+        var (toPhone, note) = ExtractWaveFields(transaction);
 
-        if (toPhone is null || recvCurrency is null)
+        if (toPhone is null)
         {
-            _logger.LogError("Transaction {Ref} is missing required wave fields — marking failed.", transaction.TransactionRef);
+            _logger.LogError("Transaction {Ref} is missing recipient phone — marking failed.", transaction.TransactionRef);
             await UpdateStatusAsync(db, transaction, "failed", null, cancellationToken);
             return;
         }
 
         try
         {
-            var result = await _waveApi.SendB2CPaymentAsync(
-                toPhone: toPhone,
-                amount: sendAmount ?? transaction.Amount,
-                currency: recvCurrency,
+            var result = await _waveApi.SendTransferAsync(
+                receiverPhone: toPhone,
+                amount: transaction.Amount,
                 transactionRef: transaction.TransactionRef,
-                description: transaction.Description ?? string.Empty,
+                note: note,
                 cancellationToken: cancellationToken);
 
-            _logger.LogInformation("Wave payment accepted. Ref={Ref} WaveRef={WaveRef} Simulated={Simulated}",
-                transaction.TransactionRef, result.WaveRef, result.Simulated);
+            _logger.LogInformation(
+                "Wave transfer accepted. Ref={Ref} WaveRef={WaveRef} Fee={Fee} Simulated={Simulated}",
+                transaction.TransactionRef, result.WaveRef, result.Fee, result.Simulated);
 
-            await UpdateStatusAsync(db, transaction, "completed", result.WaveRef, cancellationToken);
+            await UpdateStatusAsync(db, transaction, "completed", result, cancellationToken);
         }
         catch (WaveApiException ex)
         {
             _logger.LogError(ex, "Wave API error for transaction {Ref} (status={StatusCode})",
                 transaction.TransactionRef, ex.StatusCode);
 
-            // Only mark failed on non-retryable errors; keep pending for transient failures
+            // 400/422 = permanent failure (bad request, validation); others stay pending for retry
             if (ex.StatusCode is 400 or 422)
                 await UpdateStatusAsync(db, transaction, "failed", null, cancellationToken);
         }
@@ -111,7 +111,7 @@ public class TransactionProcessorWorker : BackgroundService
         AppDbContext db,
         Transaction transaction,
         string status,
-        string? waveRef,
+        WavePaymentResult? waveResult,
         CancellationToken cancellationToken)
     {
         transaction.Status = status;
@@ -119,24 +119,35 @@ public class TransactionProcessorWorker : BackgroundService
         if (status == "completed")
             transaction.CompletedAt = DateTime.UtcNow;
 
-        if (waveRef is not null)
+        if (waveResult is not null)
         {
+            transaction.Fee = waveResult.Fee;
+
+            if (!string.IsNullOrEmpty(waveResult.Currency))
+                transaction.Currency = waveResult.Currency;
+
             var extra = transaction.ExtraData is not null
                 ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(transaction.ExtraData.RootElement.GetRawText()) ?? []
                 : [];
 
-            extra["wave_ref"] = JsonSerializer.SerializeToElement(waveRef);
+            extra["wave_ref"] = JsonSerializer.SerializeToElement(waveResult.WaveRef);
+            extra["wave_transaction_id"] = JsonSerializer.SerializeToElement(waveResult.WaveTransactionId);
+            extra["wave_fee"] = JsonSerializer.SerializeToElement(waveResult.Fee);
+            extra["wave_total_deducted"] = JsonSerializer.SerializeToElement(waveResult.TotalDeducted);
+            extra["wave_currency"] = JsonSerializer.SerializeToElement(waveResult.Currency);
+            extra["wave_is_international"] = JsonSerializer.SerializeToElement(waveResult.IsInternational);
+            extra["wave_status"] = JsonSerializer.SerializeToElement(waveResult.Status);
+
             transaction.ExtraData = JsonDocument.Parse(JsonSerializer.Serialize(extra));
         }
 
         await db.SaveChangesAsync(cancellationToken);
     }
 
-    private static (string? toPhone, decimal? sendAmount, string? recvCurrency) ExtractWaveFields(Transaction transaction)
+    private static (string? toPhone, string? note) ExtractWaveFields(Transaction transaction)
     {
         var toPhone = transaction.ToPhone;
-        decimal? sendAmount = null;
-        string? recvCurrency = null;
+        var note = transaction.Description;
 
         if (transaction.ExtraData is not null)
         {
@@ -145,13 +156,10 @@ public class TransactionProcessorWorker : BackgroundService
             if (root.TryGetProperty("wave_phone", out var phoneEl))
                 toPhone = phoneEl.GetString();
 
-            if (root.TryGetProperty("net_send_amount", out var amountEl) && amountEl.TryGetDecimal(out var amt))
-                sendAmount = amt;
-
-            if (root.TryGetProperty("recv_currency", out var currEl))
-                recvCurrency = currEl.GetString();
+            if (root.TryGetProperty("note", out var noteEl))
+                note = noteEl.GetString();
         }
 
-        return (toPhone, sendAmount, recvCurrency);
+        return (toPhone, note);
     }
 }
