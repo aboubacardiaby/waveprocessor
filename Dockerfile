@@ -24,7 +24,7 @@ EXPOSE 8080
 COPY --from=build /app/publish .
 
 # Run as non-root for security
-RUN addgroup --system app && adduser --system --ingroup app app
+RUN groupadd --system app && useradd --system --gid app --no-create-home app
 USER app
 
 ENTRYPOINT ["dotnet", "WaveProcessor.dll"]
