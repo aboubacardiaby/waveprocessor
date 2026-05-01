@@ -23,8 +23,7 @@ EXPOSE 8080
 
 COPY --from=build /app/publish .
 
-# Run as non-root for security
-RUN groupadd --system app && useradd --system --gid app --no-create-home app
+# .NET 8 base image ships with a non-root 'app' user — just switch to it
 USER app
 
 ENTRYPOINT ["dotnet", "WaveProcessor.dll"]
