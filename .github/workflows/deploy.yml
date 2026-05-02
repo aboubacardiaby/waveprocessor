@@ -41,13 +41,11 @@ jobs:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
           IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${PROJECT_ID}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }}"
-
           docker build -t "$IMAGE_URI" .
           docker push "$IMAGE_URI"
-
           echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
 
-      - name: Deploy to Cloud Run
+      - name: Deploy Cloud Run Job
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           DB_CONN: ${{ secrets.DB_CONNECTION_STRING }}
@@ -56,20 +54,32 @@ jobs:
           WAVE_PIN: ${{ secrets.WAVE_PIN }}
           WAVE_KEY: ${{ secrets.WAVE_API_KEY }}
         run: |
-          gcloud run deploy "${{ env.SERVICE }}" \
-            --image "$IMAGE_URI" \
-            --region "${{ env.REGION }}" \
-            --project "$PROJECT_ID" \
-            --platform managed \
-            --port 8080 \
-            --allow-unauthenticated \
+          # Shared flags used by both create and update
+          JOB_FLAGS=(
+            --image        "$IMAGE_URI"
+            --region       "${{ env.REGION }}"
+            --project      "$PROJECT_ID"
+            --task-timeout 3600
+            --max-retries  3
             --set-env-vars "^|^ConnectionStrings__DefaultConnection=$DB_CONN|Wave__BaseUrl=$WAVE_URL|Wave__PhoneNumber=$WAVE_PHONE|Wave__Pin=$WAVE_PIN|Wave__ApiKey=$WAVE_KEY"
+          )
 
-      - name: Print service URL
+          if gcloud run jobs describe "${{ env.SERVICE }}" \
+              --region "${{ env.REGION }}" \
+              --project "$PROJECT_ID" \
+              --quiet 2>/dev/null; then
+            echo "Job exists — updating..."
+            gcloud run jobs update "${{ env.SERVICE }}" "${JOB_FLAGS[@]}"
+          else
+            echo "Job not found — creating..."
+            gcloud run jobs create "${{ env.SERVICE }}" "${JOB_FLAGS[@]}"
+          fi
+
+      - name: Describe deployed job
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
-          gcloud run services describe "${{ env.SERVICE }}" \
+          gcloud run jobs describe "${{ env.SERVICE }}" \
             --region "${{ env.REGION }}" \
             --project "$PROJECT_ID" \
-            --format "value(status.url)"
+            --format "table(name,region,status.conditions[0].type,labels.'run.googleapis.com/startTime')"
